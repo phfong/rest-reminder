@@ -564,14 +564,13 @@ class RestReminderApp:
         self.root.after(2000, lambda: self._refresh_taskbar_now(False))
 
     def _pop_to_front(self):
-        """弹出窗口到最前面"""
+        """弹出窗口到普通层最顶部（不置顶、不抢焦点）"""
         try:
             self.root.deiconify()
-            self.root.attributes('-topmost', True)
+            # 不使用 topmost：仅提升到普通层最顶，
+            # 用户点击其他窗口即可立即将其压下
+            self.root.attributes('-topmost', False)
             self.root.lift()
-            self.root.focus_force()
-            # 短暂置顶后恢复，避免一直挡屏幕
-            self.root.after(3000, lambda: self.root.attributes('-topmost', False))
         except Exception:
             pass
 

@@ -14,12 +14,19 @@
 ## 环境要求
 
 - Windows 系统
-- Python 3.x
-- [Pillow](https://pillow.readthedocs.io/)（用于生成任务栏图标）
+- Python 3.x（[python.org](https://www.python.org/downloads/) 安装时务必勾选 **Add python.exe to PATH**，会同时提供后台运行所需的 `pythonw.exe`）
+- [Pillow](https://pillow.readthedocs.io/)（用于生成任务栏图标，唯一的第三方依赖）
 
-```bash
-pip install pillow
-```
+### 安装步骤（Windows）
+
+1. 安装 Python：从 [python.org/downloads](https://www.python.org/downloads/) 下载安装包，勾选 "Add python.exe to PATH"；
+2. 安装 Pillow：按 `Win + R` 输入 `cmd` 打开命令提示符，执行：
+
+   ```
+   pip install pillow
+   ```
+
+3. 将 `rest_reminder.pyw`、`rest_reminder_config.json`、`启动提醒.bat` 放在同一目录，双击 `启动提醒.bat` 启动。
 
 ## 使用方法
 

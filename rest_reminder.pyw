@@ -167,7 +167,7 @@ class RestReminderApp:
                         data = conn.recv(1024)
                         conn.close()
                         if data == b'SHOW':
-                            self.root.after(0, self._pop_to_front)
+                            self.root.after(0, self._flash_taskbar)
                 except Exception:
                     time.sleep(0.2)
         self._listen_thread = threading.Thread(target=_listen, daemon=True)
@@ -450,7 +450,8 @@ class RestReminderApp:
                     text=f"站起来活动一下吧！剩余 {timer_text}"
                 )
             icon_mins = math.ceil(self.countdown_seconds / 60)
-            self._update_taskbar_icon(icon_mins, True)
+            # 休息期间不做隐藏/重显刷新（cycle_button=False），避免窗口再次弹出
+            self._update_taskbar_icon(icon_mins, True, cycle_button=False)
         else:
             mins, secs = divmod(self.work_seconds, 60)
             timer_text = f"{mins:02d}:{secs:02d}"
@@ -513,7 +514,7 @@ class RestReminderApp:
         self.is_resting = True
         self.countdown_seconds = self.rest_minutes * 60
         self._switch_to_rest_ui()
-        self._pop_to_front()
+        self._notify_rest_start()
 
     def _do_end_rest(self):
         """在主线程中切换到工作模式"""
@@ -563,14 +564,64 @@ class RestReminderApp:
         self.root.after(500, lambda: self._refresh_taskbar_now(False))
         self.root.after(2000, lambda: self._refresh_taskbar_now(False))
 
-    def _pop_to_front(self):
-        """弹出窗口到普通层最顶部（不置顶、不抢焦点）"""
+    def _notify_rest_start(self):
+        """休息开始：短暂置顶引起注意，2秒后回落到普通层并恢复原前台窗口。
+
+        置顶期间窗口会成为前台窗口（这是让窗口出现在最前面的必要条件），
+        2秒后取消置顶并用 SetForegroundWindow 把前台交还给之前的窗口，
+        用户可立即操作原窗口，无需先点击提醒窗口。
+        """
         try:
+            user32 = ctypes.windll.user32
+            # 记住当前前台窗口，2秒后恢复它
+            prev_fg = user32.GetForegroundWindow()
             self.root.deiconify()
-            # 不使用 topmost：仅提升到普通层最顶，
-            # 用户点击其他窗口即可立即将其压下
-            self.root.attributes('-topmost', False)
+            self.root.attributes('-topmost', True)
             self.root.lift()
+            self.root.after(2000, lambda: self._clear_topmost(prev_fg))
+        except Exception:
+            pass
+
+    def _clear_topmost(self, prev_fg=0):
+        """取消置顶，回到普通层，恢复之前的前台窗口。
+
+        关键：不用 SW_HIDE→SW_SHOWNOACTIVATE（会造成窗口闪现再次弹出），
+        而是直接取消 topmost 标志，然后把前台交还给置顶前的窗口。
+        """
+        try:
+            self.root.attributes('-topmost', False)
+            self.root.update_idletasks()  # 确保 topmost 已实际移除
+            user32 = ctypes.windll.user32
+            if prev_fg and user32.IsWindow(prev_fg):
+                user32.SetForegroundWindow(prev_fg)
+        except Exception:
+            try:
+                self.root.attributes('-topmost', False)
+            except Exception:
+                pass
+
+    def _flash_taskbar(self):
+        """闪烁任务栏按钮引起注意（不弹出窗口、不抢焦点），用于重复启动唤醒旧实例"""
+        try:
+            hwnd = self._get_top_hwnd()
+            if not hwnd:
+                return
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint),
+                            ("hwnd", ctypes.c_void_p),
+                            ("dwFlags", ctypes.c_uint),
+                            ("uCount", ctypes.c_uint),
+                            ("dwTimeout", ctypes.c_uint)]
+            FLASHW_ALL = 0x00000003        # 同时闪烁标题栏与任务栏按钮
+            FLASHW_TIMERNOFG = 0x0000000C  # 持续闪烁直到窗口获得焦点
+            fwi = FLASHWINFO()
+            fwi.cbSize = ctypes.sizeof(fwi)
+            fwi.hwnd = hwnd
+            fwi.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG
+            fwi.uCount = 5
+            fwi.dwTimeout = 0
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(fwi))
         except Exception:
             pass
 

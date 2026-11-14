@@ -8,8 +8,10 @@
    - 修正 ctypes 句柄类型：旧版 LoadImageW / GetParent / SetClassLongPtrW 没声明
      restype/argtypes，64 位 Python 下句柄会被截成 32 位，调用时好时坏（刷新“不灵”的主因之一）；
    - 旧 HICON 会 DestroyIcon 释放，不再每次刷新泄漏 2 个句柄；
-   - 只在窗口“最小化”时做隐藏/重显来重建任务栏按钮（Win11 的 Explorer 不认 WM_SETICON
-     的实时更新），窗口可见时只走 WM_SETICON —— 旧版在休息期间为防弹窗把刷新整个关掉了，
+   - 每次分钟数变化时强制 Explorer 重建任务栏按钮：优先用 ITaskbarList4 的
+     DeleteTab + AddTab（不依赖按钮状态，且不会改变按钮顺序），COM 不可用时退回
+     隐藏/重显；另外补 SetWindowPos(SWP_FRAMECHANGED) 和标题里的剩余分钟数。
+     窗口可见时只走 WM_SETICON —— 旧版在休息期间为防弹窗把刷新整个关掉了，
      所以休息倒计时那几分钟数字是冻住的；现在两种模式都会刷新，
      同时不会再出现“休息时窗口重新弹到前面”的老问题。
 2. 忙着的时候隐藏弹窗
@@ -76,6 +78,21 @@ IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x0010
 SW_HIDE = 0
 SW_SHOWMINNOACTIVE = 7
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+GW_HWNDNEXT = 2
+ICON_BIG_PX = 256
+ICON_SMALL_PX = 64
+
+# ITaskbarList4：让 Explorer 删掉再重建任务栏按钮（强制重读图标）
+CLSID_TASKBAR_LIST = "{56FDF344-FD6D-11d0-958A-006097C9A090}"
+IID_TASKBAR_LIST4 = "{C43DC798-95D1-4BEA-9030-BB99E2983A1A}"
+VT_HINIT = 3
+VT_ADDTAB = 4
+VT_DELTAB = 5
+CLSCTX_INPROC_SERVER = 1
 
 ERROR_ALREADY_EXISTS = 183
 
@@ -90,6 +107,27 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+ole32 = ctypes.WinDLL("ole32")
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, text):
+        super().__init__()
+        if ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(self)) != 0:
+            raise OSError("CLSIDFromString failed: " + text)
+
+
+ole32.CoInitialize.argtypes = (wintypes.LPVOID,)
+ole32.CoInitialize.restype = ctypes.c_long
+ole32.CLSIDFromString.argtypes = (wintypes.LPCWSTR, ctypes.c_void_p)
+ole32.CLSIDFromString.restype = ctypes.c_long
+ole32.CoCreateInstance.argtypes = (ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                   ctypes.c_void_p, ctypes.c_void_p)
+ole32.CoCreateInstance.restype = ctypes.c_long
+
 
 user32.GetAncestor.restype = wintypes.HWND
 user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
@@ -104,6 +142,11 @@ user32.IsIconic.argtypes = (wintypes.HWND,)
 user32.IsIconic.restype = wintypes.BOOL
 user32.IsWindow.argtypes = (wintypes.HWND,)
 user32.IsWindow.restype = wintypes.BOOL
+user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetWindow.restype = wintypes.HWND
+user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT)
+user32.SetWindowPos.restype = wintypes.BOOL
 user32.SendMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 user32.SendMessageW.restype = ctypes.c_ssize_t
 user32.LoadImageW.argtypes = (wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
@@ -169,6 +212,21 @@ def save_config(cfg):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False)
     except Exception:
+        pass
+
+
+DEBUG = os.environ.get("REST_REMINDER_DEBUG") == "1"
+_DEBUG_LOG = os.path.join(os.path.dirname(CONFIG_FILE), "rest_reminder_debug.log")
+
+
+def _dbg(*args):
+    """排障日志：设置环境变量 REST_REMINDER_DEBUG=1 后写入程序目录。"""
+    if not DEBUG:
+        return
+    try:
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S ") + " ".join(str(a) for a in args) + "\n")
+    except OSError:
         pass
 
 
@@ -278,6 +336,10 @@ class RestReminderApp:
         self._hicons = (None, None)
         self._last_iconic = None
         self._icon_fail_until = 0.0
+        self._return_fg = 0          # 提醒弹出前的前台窗口，用于把焦点还回去
+        self._title = app_name       # 当前窗口标题（每分钟带一次剩余分钟数）
+        self._taskbar = None         # ITaskbarList4，用于重建任务栏按钮
+        self._taskbar_failed_until = 0.0
 
         # 渲染缓存
         self._last_timer_text = None
@@ -542,17 +604,41 @@ class RestReminderApp:
             edge = ICON_REST_EDGE if resting else ICON_WORK_EDGE
             img = render_icon_image(str(minutes), bg, edge)
             img.save(self._ico_path, format="ICO", sizes=ICO_SIZES)
-            if self._install_icons(hwnd):
-                self._icon_key = key
-                self._cycle_taskbar_button(hwnd)
-            else:
+            if not self._install_icons(hwnd):
                 self._icon_fail_until = time.monotonic() + 2.0
+                return
+            self._icon_key = key
+            # WM_SETICON 之后补一次 SWP_FRAMECHANGED，并让标题带上剩余分钟数：
+            # Win11 的 Explorer 只有按钮被“重建/重读”时才换图标，这两个动作
+            # 都会促使它重新取一次窗口图标（标题变化本身也能让按钮刷新）。
+            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+            self._touch_title(int(minutes), resting)
+            self._cycle_taskbar_button(hwnd)
+            _dbg("icon", minutes, "rest" if resting else "work",
+                 "iconic", user32.IsIconic(hwnd),
+                 "fg_is_ours", user32.GetForegroundWindow() == hwnd)
         except Exception:
             self._icon_fail_until = time.monotonic() + 2.0
 
+    def _touch_title(self, minutes, resting):
+        """窗口标题带上剩余分钟数（任务栏悬停可见，同时促使按钮刷新）。"""
+        text = f"{app_name} · 剩余 {minutes} 分钟"
+        if text == self._title:
+            return
+        self._title = text
+        try:
+            self.root.title(text)
+        except tk.TclError:
+            pass
+
     def _install_icons(self, hwnd):
-        hbig = user32.LoadImageW(None, self._ico_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
-        hsmall = user32.LoadImageW(None, self._ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+        # 直接取 256/64 的大图交给系统缩放：Win11 任务栏在高 DPI 下会用到
+        # 比 16px 大得多的图标，给 16px 小图时按钮可能干脆不刷新。
+        hbig = user32.LoadImageW(None, self._ico_path, IMAGE_ICON,
+                                 ICON_BIG_PX, ICON_BIG_PX, LR_LOADFROMFILE)
+        hsmall = user32.LoadImageW(None, self._ico_path, IMAGE_ICON,
+                                   ICON_SMALL_PX, ICON_SMALL_PX, LR_LOADFROMFILE)
         if not hbig and not hsmall:
             return False
         if hbig:
@@ -573,8 +659,12 @@ class RestReminderApp:
     def _cycle_taskbar_button(self, hwnd):
         """Win11 的 Explorer 只在任务栏按钮被重建时才重读图标。
 
-        只在窗口“已最小化”时做隐藏/重显：
-        - 最小化时没有可见窗口，重显不会把窗口弹到前台（旧版的“又弹出来”问题）；
+        首选 ITaskbarList4 的 DeleteTab + AddTab：这是唯一“强制重建”的手段，
+        不依赖按钮当前是激活/最小化/丢失焦点中的哪种状态（实测不会改变按钮
+        在任务栏中的顺序和位置）。COM 不可用时退回旧的 隐藏/重显。
+
+        隐藏/重显只在窗口“已最小化”时做：
+        - 最小化时没有可见窗口，重显不会把窗口弹到前台；
         - 窗口可见时直接用 WM_SETICON，不折腾；
         - 重显用 SW_SHOWMINNOACTIVE，保持最小化且不抢焦点。
         """
@@ -583,8 +673,95 @@ class RestReminderApp:
                 return
             if not user32.IsIconic(hwnd):
                 return
+            if self._retab_taskbar_button(hwnd):
+                return
+            if user32.GetForegroundWindow() == hwnd:
+                self._yield_foreground(hwnd)
             user32.ShowWindow(hwnd, SW_HIDE)
             user32.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
+            _dbg("cycled button")
+        except Exception:
+            pass
+
+    # -- ITaskbarList4 调用 -------------------------------------------------
+    def _taskbar_vtable(self):
+        return ctypes.cast(self._taskbar,
+                           ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+
+    def _taskbar_call0(self, index):
+        proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+        return proto(self._taskbar_vtable()[index])(self._taskbar)
+
+    def _taskbar_call1(self, index, hwnd):
+        proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+        return proto(self._taskbar_vtable()[index])(self._taskbar,
+                                                     ctypes.c_void_p(hwnd))
+
+    def _retab_taskbar_button(self, hwnd):
+        """DeleteTab + AddTab：让 Explorer 丢弃旧按钮、按当前 HICON 重建一个。"""
+        if time.monotonic() < self._taskbar_failed_until:
+            return False
+        try:
+            if self._taskbar is None:
+                ole32.CoInitialize(None)  # 已初始化时返回 S_FALSE，可忽略
+                obj = ctypes.c_void_p()
+                hr = ole32.CoCreateInstance(
+                    ctypes.byref(GUID(CLSID_TASKBAR_LIST)), None,
+                    CLSCTX_INPROC_SERVER,
+                    ctypes.byref(GUID(IID_TASKBAR_LIST4)), ctypes.byref(obj))
+                if hr != 0 or not obj:
+                    raise OSError("CoCreateInstance 0x%08x" % (hr & 0xFFFFFFFF))
+                self._taskbar = obj
+                if self._taskbar_call0(VT_HINIT) != 0:
+                    raise OSError("HrInit failed")
+            hr = self._taskbar_call1(VT_DELTAB, hwnd)
+            if hr < 0:  # HRESULT 失败（S_OK/S_FALSE 都算正常）
+                raise OSError("DeleteTab 0x%08x" % (hr & 0xFFFFFFFF))
+            hr = self._taskbar_call1(VT_ADDTAB, hwnd)
+            if hr < 0:
+                raise OSError("AddTab 0x%08x" % (hr & 0xFFFFFFFF))
+            _dbg("retab", hwnd)
+            return True
+        except Exception as exc:
+            self._taskbar = None
+            # Explorer 重启后旧接口会失效，60 秒后重新 CoCreateInstance
+            self._taskbar_failed_until = time.monotonic() + 60.0
+            _dbg("retab failed", exc)
+            return False
+
+
+    def _yield_foreground(self, hwnd):
+        """把前台让给另一个窗口（优先还给提醒弹出前的前台窗口）。"""
+        candidates = []
+        if self._return_fg and self._return_fg != hwnd:
+            candidates.append(self._return_fg)
+        try:
+            nxt = user32.GetWindow(hwnd, GW_HWNDNEXT)
+            for _ in range(40):
+                if not nxt:
+                    break
+                candidates.append(nxt)
+                nxt = user32.GetWindow(nxt, GW_HWNDNEXT)
+        except Exception:
+            pass
+        for cand in candidates:
+            try:
+                if (not cand or cand == hwnd or not user32.IsWindow(cand)
+                        or not user32.IsWindowVisible(cand) or user32.IsIconic(cand)):
+                    continue
+                if user32.SetForegroundWindow(cand):
+                    _dbg("yielded foreground to", cand)
+                    return True
+            except Exception:
+                continue
+        _dbg("yield foreground failed")
+        return False
+
+    def _release_foreground_if_ours(self):
+        try:
+            hwnd = self._top_hwnd()
+            if hwnd and user32.GetForegroundWindow() == hwnd:
+                self._yield_foreground(hwnd)
         except Exception:
             pass
 
@@ -755,6 +932,7 @@ class RestReminderApp:
         """
         try:
             prev_fg = user32.GetForegroundWindow()
+            self._return_fg = prev_fg
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self.root.lift()
@@ -797,6 +975,12 @@ class RestReminderApp:
             self.root.iconify()
         except tk.TclError:
             pass
+        # 最小化后若焦点仍在本窗口，任务栏按钮会停在“激活”样式，
+        # 之后的图标刷新就不生效；顺手把前台还给用户原来的窗口。
+        self.root.after(80, self._release_foreground_if_ours)
+        # 最小化那一刻按钮是新建的，等它建好再强制重刷一次图标，
+        # 免得 Explorer 拿最小化前的旧图（“隐藏后一直停在休息 3”的现场）。
+        self.root.after(220, lambda: self._sync_icon(force=True))
         return "break"
 
     def _show_window(self):

@@ -57,7 +57,9 @@
 
 ## 技术要点
 
-- 任务栏图标用 PIL 绘制多尺寸 ICO，再通过 `WM_SETICON` + `SetClassLongPtr` 写入窗口图标；Win11 资源管理器只对后台窗口缓存按钮图标，因此仅在窗口已最小化时用 `SW_HIDE` → `SW_SHOWMINNOACTIVE` 重建按钮（可见窗口不重建，避免窗口被顶到前台）
+- 任务栏图标用 PIL 绘制多尺寸 ICO，再通过 `WM_SETICON` + `SetClassLongPtr` 写入窗口图标。Win11 的 Explorer 不会因为 `WM_SETICON` 就重画已存在的任务栏按钮，所以每次分钟数变化后会按顺序补三次“提醒”：`SetWindowPos(SWP_FRAMECHANGED)` 刷新非客户区、标题带上剩余分钟数、以及用 `ITaskbarList4::DeleteTab + AddTab` 让 Explorer **丢弃并重建**按钮（实测重建不会改变按钮在任务栏中的顺序）；COM 不可用时退回 `SW_HIDE` → `SW_SHOWMINNOACTIVE`。窗口可见时不重建按钮，避免把窗口顶到前台
+- 最小化窗口若仍是前台窗口，按钮会停在“激活”样式而不重读图标，刷新前先把前台让给 z 序中下一个可见窗口
+- 开启调试日志：设置环境变量 `REST_REMINDER_DEBUG=1` 后启动，会在程序目录生成 `rest_reminder_debug.log`，记录每次图标写入、title 刷新与按钮重建的结果
 - 计时在主线程用 250 ms 定时循环 + `time.monotonic()` 时间差累加推进，不靠后台线程改 UI；锁屏期间暂停计时，短暂锁屏（如 UAC）不重置，休眠超过 2 分钟回来重新计时
 - 所有 Win32 调用（`LoadImageW`、`GetAncestor`、`SendMessageW` 等）显式声明 `restype`/`argtypes`，避免 64 位句柄被截断；替换图标时用 `DestroyIcon` 释放旧句柄
 
